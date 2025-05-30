@@ -2,7 +2,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 import uuid
 
-from app.db.supabase import supabase_client
+# from app.db.supabase import supabase_client # Removed
+from app.db.mongodb import get_database # Added
 from app.models.project import (
     ProjectCreate,
     ProjectUpdate,
@@ -26,25 +27,26 @@ class ProjectService:
         Returns:
             Created project data
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.utcnow() # Use datetime object
         project_id = str(uuid.uuid4())
         
-        project_dict = project_data.dict()
+        project_dict = project_data.model_dump() # Pydantic V2
         project_dict.update({
-            "id": project_id,
+            "id": project_id,    # Keep our 'id' field consistent
             "status": "draft",
             "created_at": now,
             "updated_at": now,
-            "objectives": [obj.value for obj in project_data.objectives]  # Convert enum to string
+            "objectives": [obj.value for obj in project_data.objectives]
         })
         
+        db = get_database()
         try:
-            result = supabase_client.table("projects").insert(project_dict).execute()
-            inserted = result.data[0]
-            
-            # Convert back to our Pydantic model
-            return Project(**inserted)
+            await db["projects"].insert_one(project_dict)
+            # Assuming project_dict is correct and matches Project model structure
+            # for returning. The Project model expects datetime objects.
+            return Project(**project_dict)
         except Exception as e:
+            # Log error
             raise Exception(f"Failed to create project: {str(e)}")
     
     @staticmethod
@@ -58,21 +60,19 @@ class ProjectService:
         Returns:
             Project data or None if not found
         """
+        db = get_database()
         try:
-            result = supabase_client.table("projects").select("*").eq("id", project_id).execute()
+            project_data = await db["projects"].find_one({"id": project_id})
             
-            if not result.data:
+            if not project_data:
                 return None
-                
-            project_data = result.data[0]
             
-            # Get related files and results
-            floorplan = await ProjectService._get_floorplan(project_id)
-            usage_data = await ProjectService._get_usage_data(project_id)
-            insight_result = await ProjectService._get_insight_result(project_id)
-            moodboard_result = await ProjectService._get_moodboard_result(project_id)
+            # Related data fetching (floorplan, usage_data, etc.) will be updated later.
+            floorplan = await ProjectService._get_floorplan(project_id) # Placeholder
+            usage_data = await ProjectService._get_usage_data(project_id) # Placeholder
+            insight_result = await ProjectService._get_insight_result(project_id) # Placeholder
+            moodboard_result = await ProjectService._get_moodboard_result(project_id) # Placeholder
             
-            # Add to project data
             project_data.update({
                 "floorplan": floorplan,
                 "usage_data": usage_data,
@@ -82,6 +82,7 @@ class ProjectService:
             
             return Project(**project_data)
         except Exception as e:
+            # Log error
             raise Exception(f"Failed to get project: {str(e)}")
     
     @staticmethod
@@ -95,21 +96,27 @@ class ProjectService:
         Returns:
             List of projects
         """
+        db = get_database()
         try:
-            result = supabase_client.table("projects").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+            # MongoDB sort: 1 for ascending, -1 for descending
+            cursor = db["projects"].find({"user_id": user_id}).sort("created_at", -1)
+            projects_data = await cursor.to_list(length=None) # Fetch all matching documents
             
             projects = []
-            for project_data in result.data:
-                project_id = project_data["id"]
+            for project_data_item in projects_data: # renamed to avoid conflict
+                project_id = project_data_item["id"]
                 
-                # Get related data
-                floorplan = await ProjectService._get_floorplan(project_id)
-                project_data["floorplan"] = floorplan
+                # Related data fetching (e.g., floorplan) will be updated later.
+                floorplan = await ProjectService._get_floorplan(project_id) # Placeholder
+                project_data_item["floorplan"] = floorplan
+                # Other related data (usage_data, etc.) also needs to be fetched if included in original
+                # For now, only floorplan was explicitly mentioned in original snippet for this loop
                 
-                projects.append(Project(**project_data))
+                projects.append(Project(**project_data_item))
                 
             return projects
         except Exception as e:
+            # Log error
             raise Exception(f"Failed to get user projects: {str(e)}")
     
     @staticmethod
@@ -124,20 +131,29 @@ class ProjectService:
         Returns:
             Updated project data
         """
+        db = get_database()
         try:
-            update_dict = project_data.dict(exclude_unset=True)
-            update_dict["updated_at"] = datetime.utcnow().isoformat()
+            update_dict = project_data.model_dump(exclude_unset=True) # Pydantic V2
+            update_dict["updated_at"] = datetime.utcnow() # Use datetime object
             
-            # Convert enum values to strings if present
             if "objectives" in update_dict and update_dict["objectives"]:
                 update_dict["objectives"] = [obj.value for obj in update_dict["objectives"]]
             
-            result = supabase_client.table("projects").update(update_dict).eq("id", project_id).execute()
+            result = await db["projects"].update_one(
+                {"id": project_id},
+                {"$set": update_dict}
+            )
             
-            if not result.data:
-                raise Exception(f"Project with ID {project_id} not found")
+            if result.matched_count == 0:
+                raise Exception(f"Project with ID {project_id} not found for update")
+            # if result.modified_count == 0:
+                # Consider logging if no modification occurred but matched.
+                # pass
                 
-            return await ProjectService.get_project(project_id)
+            updated_project = await ProjectService.get_project(project_id)
+            if not updated_project:
+                raise Exception(f"Failed to retrieve project {project_id} after update.")
+            return updated_project
         except Exception as e:
             raise Exception(f"Failed to update project: {str(e)}")
     
@@ -152,16 +168,19 @@ class ProjectService:
         Returns:
             True if successful
         """
+        db = get_database()
         try:
-            # Delete related files and results
+            # Delete related files and results (these methods will be migrated)
             await ProjectService._delete_floorplan(project_id)
             await ProjectService._delete_usage_data(project_id)
             await ProjectService._delete_insight_result(project_id)
             await ProjectService._delete_moodboard_result(project_id)
             
-            # Delete project
-            result = supabase_client.table("projects").delete().eq("id", project_id).execute()
+            result = await db["projects"].delete_one({"id": project_id})
             
+            if result.deleted_count == 0:
+                # Optionally raise an error or log if project not found for deletion
+                pass
             return True
         except Exception as e:
             raise Exception(f"Failed to delete project: {str(e)}")
@@ -178,6 +197,7 @@ class ProjectService:
         Returns:
             FloorplanFile object
         """
+        db = get_database()
         try:
             floorplan_dict = {
                 "project_id": project_id,
@@ -185,31 +205,26 @@ class ProjectService:
                 "filename": floorplan_data.get("original_filename", "floorplan"),
                 "url": floorplan_data["secure_url"],
                 "file_type": floorplan_data.get("format", "unknown"),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.utcnow(), # Use datetime object
                 "size": floorplan_data.get("bytes", 0),
                 "width": floorplan_data.get("width"),
                 "height": floorplan_data.get("height")
             }
             
-            # Check if floorplan exists
-            exist_result = supabase_client.table("floorplans").select("*").eq("project_id", project_id).execute()
+            # Upsert: update if exists, insert if not
+            await db["floorplans"].update_one(
+                {"project_id": project_id},
+                {"$set": floorplan_dict},
+                upsert=True
+            )
             
-            if exist_result.data:
-                # Update existing
-                result = supabase_client.table("floorplans").update(floorplan_dict).eq("project_id", project_id).execute()
-            else:
-                # Insert new
-                result = supabase_client.table("floorplans").insert(floorplan_dict).execute()
-            
-            # Update project status
-            await ProjectService._update_project_status(project_id)
-            
+            await ProjectService._update_project_status(project_id) # This method also needs migration
             return FloorplanFile(**floorplan_dict)
         except Exception as e:
             raise Exception(f"Failed to add floorplan: {str(e)}")
     
     @staticmethod
-    async def add_usage_data(project_id: str, usage_data: Dict[str, Any], metadata: Dict[str, Any]) -> UsageDataFile:
+    async def add_usage_data(project_id: str, usage_data: Dict[str, Any], metadata: Dict[str, Any]) -> UsageDataFile: # Parameter name 'usage_data' kept as is
         """
         Add or update usage data for a project
         
@@ -221,31 +236,26 @@ class ProjectService:
         Returns:
             UsageDataFile object
         """
+        db = get_database()
         try:
             data_dict = {
                 "project_id": project_id,
-                "file_id": usage_data["public_id"],
+                "file_id": usage_data["public_id"], # 'usage_data' is the parameter name
                 "filename": usage_data.get("original_filename", "usage_data.csv"),
                 "url": usage_data["secure_url"],
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.utcnow(), # Use datetime object
                 "size": usage_data.get("bytes", 0),
                 "row_count": metadata.get("row_count"),
                 "column_count": metadata.get("column_count")
             }
             
-            # Check if usage data exists
-            exist_result = supabase_client.table("usage_data").select("*").eq("project_id", project_id).execute()
+            await db["usage_data_files"].update_one( # Changed collection name
+                {"project_id": project_id},
+                {"$set": data_dict},
+                upsert=True
+            )
             
-            if exist_result.data:
-                # Update existing
-                result = supabase_client.table("usage_data").update(data_dict).eq("project_id", project_id).execute()
-            else:
-                # Insert new
-                result = supabase_client.table("usage_data").insert(data_dict).execute()
-                
-            # Update project status
             await ProjectService._update_project_status(project_id)
-            
             return UsageDataFile(**data_dict)
         except Exception as e:
             raise Exception(f"Failed to add usage data: {str(e)}")
@@ -262,8 +272,9 @@ class ProjectService:
         Returns:
             InsightResult object
         """
+        db = get_database()
         try:
-            now = datetime.utcnow().isoformat()
+            now = datetime.utcnow() # Use datetime object
             result_dict = {
                 "project_id": project_id,
                 "heatmap_url": insight_data.get("heatmap_url"),
@@ -273,18 +284,16 @@ class ProjectService:
                 "updated_at": now
             }
             
-            # Check if insight result exists
-            exist_result = supabase_client.table("insight_results").select("*").eq("project_id", project_id).execute()
+            await db["insight_results"].update_one(
+                {"project_id": project_id},
+                {"$set": result_dict},
+                upsert=True
+            )
             
-            if exist_result.data:
-                # Update existing
-                result = supabase_client.table("insight_results").update(result_dict).eq("project_id", project_id).execute()
-            else:
-                # Insert new
-                result = supabase_client.table("insight_results").insert(result_dict).execute()
-                
-            # Update project status to "completed"
-            await supabase_client.table("projects").update({"status": "completed", "updated_at": now}).eq("id", project_id).execute()
+            await db["projects"].update_one(
+                {"id": project_id},
+                {"$set": {"status": "completed", "updated_at": now}}
+            )
             
             return InsightResult(**result_dict)
         except Exception as e:
@@ -302,8 +311,9 @@ class ProjectService:
         Returns:
             MoodboardResult object
         """
+        db = get_database()
         try:
-            now = datetime.utcnow().isoformat()
+            now = datetime.utcnow() # Use datetime object
             moodboard_dict = {
                 "project_id": project_id,
                 "moodboard_url": moodboard_data["moodboard_url"],
@@ -311,16 +321,11 @@ class ProjectService:
                 "created_at": now
             }
             
-            # Check if moodboard result exists
-            exist_result = supabase_client.table("moodboard_results").select("*").eq("project_id", project_id).execute()
-            
-            if exist_result.data:
-                # Update existing
-                result = supabase_client.table("moodboard_results").update(moodboard_dict).eq("project_id", project_id).execute()
-            else:
-                # Insert new
-                result = supabase_client.table("moodboard_results").insert(moodboard_dict).execute()
-                
+            await db["moodboard_results"].update_one(
+                {"project_id": project_id},
+                {"$set": moodboard_dict},
+                upsert=True
+            )
             return MoodboardResult(**moodboard_dict)
         except Exception as e:
             raise Exception(f"Failed to add moodboard result: {str(e)}")
@@ -328,92 +333,93 @@ class ProjectService:
     # Private helper methods
     @staticmethod
     async def _get_floorplan(project_id: str) -> Optional[FloorplanFile]:
+        db = get_database()
         try:
-            result = supabase_client.table("floorplans").select("*").eq("project_id", project_id).execute()
-            
-            if not result.data:
+            result = await db["floorplans"].find_one({"project_id": project_id})
+            if not result:
                 return None
-                
-            return FloorplanFile(**result.data[0])
-        except Exception:
+            return FloorplanFile(**result)
+        except Exception: # Log error
             return None
     
     @staticmethod
     async def _get_usage_data(project_id: str) -> Optional[UsageDataFile]:
+        db = get_database()
         try:
-            result = supabase_client.table("usage_data").select("*").eq("project_id", project_id).execute()
-            
-            if not result.data:
+            result = await db["usage_data_files"].find_one({"project_id": project_id}) # Changed collection name
+            if not result:
                 return None
-                
-            return UsageDataFile(**result.data[0])
-        except Exception:
+            return UsageDataFile(**result)
+        except Exception: # Log error
             return None
     
     @staticmethod
     async def _get_insight_result(project_id: str) -> Optional[InsightResult]:
+        db = get_database()
         try:
-            result = supabase_client.table("insight_results").select("*").eq("project_id", project_id).execute()
-            
-            if not result.data:
+            result = await db["insight_results"].find_one({"project_id": project_id})
+            if not result:
                 return None
-                
-            return InsightResult(**result.data[0])
-        except Exception:
+            return InsightResult(**result)
+        except Exception: # Log error
             return None
     
     @staticmethod
     async def _get_moodboard_result(project_id: str) -> Optional[MoodboardResult]:
+        db = get_database()
         try:
-            result = supabase_client.table("moodboard_results").select("*").eq("project_id", project_id).execute()
-            
-            if not result.data:
+            result = await db["moodboard_results"].find_one({"project_id": project_id})
+            if not result:
                 return None
-                
-            return MoodboardResult(**result.data[0])
-        except Exception:
+            return MoodboardResult(**result)
+        except Exception: # Log error
             return None
     
     @staticmethod
     async def _delete_floorplan(project_id: str) -> bool:
+        db = get_database()
         try:
-            supabase_client.table("floorplans").delete().eq("project_id", project_id).execute()
+            await db["floorplans"].delete_one({"project_id": project_id})
             return True
-        except Exception:
+        except Exception: # Log error
             return False
     
     @staticmethod
     async def _delete_usage_data(project_id: str) -> bool:
+        db = get_database()
         try:
-            supabase_client.table("usage_data").delete().eq("project_id", project_id).execute()
+            await db["usage_data_files"].delete_one({"project_id": project_id}) # Changed collection name
             return True
-        except Exception:
+        except Exception: # Log error
             return False
     
     @staticmethod
     async def _delete_insight_result(project_id: str) -> bool:
+        db = get_database()
         try:
-            supabase_client.table("insight_results").delete().eq("project_id", project_id).execute()
+            await db["insight_results"].delete_one({"project_id": project_id})
             return True
-        except Exception:
+        except Exception: # Log error
             return False
     
     @staticmethod
     async def _delete_moodboard_result(project_id: str) -> bool:
+        db = get_database()
         try:
-            supabase_client.table("moodboard_results").delete().eq("project_id", project_id).execute()
+            await db["moodboard_results"].delete_one({"project_id": project_id})
             return True
-        except Exception:
+        except Exception: # Log error
             return False
     
     @staticmethod
     async def _update_project_status(project_id: str) -> None:
         """Update project status based on uploaded files"""
+        db = get_database()
         try:
             floorplan = await ProjectService._get_floorplan(project_id)
             usage_data = await ProjectService._get_usage_data(project_id)
             
-            now = datetime.utcnow().isoformat()
+            now = datetime.utcnow() # Use datetime object
             status = "draft"
             
             if floorplan and usage_data:
@@ -421,9 +427,12 @@ class ProjectService:
             elif floorplan or usage_data:
                 status = "in_progress"
                 
-            await supabase_client.table("projects").update({"status": status, "updated_at": now}).eq("id", project_id).execute()
-        except Exception:
-            pass
+            await db["projects"].update_one(
+                {"id": project_id},
+                {"$set": {"status": status, "updated_at": now}}
+            )
+        except Exception: # Log error
+            pass # Original method also suppresses exceptions here
 
 
 project_service = ProjectService() 

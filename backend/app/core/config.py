@@ -28,10 +28,12 @@ class Settings(BaseSettings):
             return v
         raise ValueError(v)
 
-    # Supabase Settings
-    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
-    SUPABASE_JWT_SECRET: str = os.getenv("SUPABASE_JWT_SECRET", "")
+    # MongoDB Settings
+    MONGODB_CONNECTION_STRING: str = os.getenv("MONGODB_CONNECTION_STRING", "mongodb://localhost:27017")
+    MONGODB_DATABASE_NAME: str = os.getenv("MONGODB_DATABASE_NAME", "meyraki_db")
+
+    # JWT Settings
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "a_new_super_secret_key_for_jwt")
 
     # Cloudinary Settings
     CLOUDINARY_CLOUD_NAME: str = os.getenv("CLOUDINARY_CLOUD_NAME", "")
