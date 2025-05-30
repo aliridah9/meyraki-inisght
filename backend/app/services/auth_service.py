@@ -4,7 +4,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 
 from app.core.config import settings
-from app.db.supabase import supabase_client
+# from app.db.supabase import supabase_client # Removed
+from app.db.mongodb import get_database # Added
+# from app.models.user import User as UserModel # Optional, if returning model instance
 
 security = HTTPBearer()
 
@@ -27,9 +29,9 @@ class AuthService:
             # Decode and verify
             payload = jwt.decode(
                 token,
-                settings.SUPABASE_JWT_SECRET,
+                settings.JWT_SECRET_KEY, # Changed
                 algorithms=[unverified_header["alg"]],
-                audience="authenticated",
+                # audience="authenticated", # Removed
             )
             
             return payload
@@ -90,26 +92,33 @@ async def get_current_user(token_data: Dict[str, Any] = Depends(validate_token))
         User data
     """
     try:
-        # Get user data from Supabase
-        user_id = token_data["user_id"]
-        user = supabase_client.auth.admin.get_user_by_id(user_id)
+        user_id = token_data["user_id"] # Extracted from 'sub' in validate_token
         
-        if not user:
+        db = get_database()
+        user_doc = await db["users"].find_one({"id": user_id}) # Query MongoDB by 'id' field
+
+        if not user_doc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found",
             )
             
+        # Construct the dictionary to be returned, similar to previous structure
+        # Ensure all fields are present as expected by downstream code
         return {
-            "id": user.id,
-            "email": user.email,
-            "app_metadata": user.app_metadata,
-            "user_metadata": user.user_metadata,
-            "created_at": user.created_at,
-            "role": token_data.get("role", "user"),
+            "id": user_doc.get("id"),
+            "email": user_doc.get("email"),
+            "app_metadata": user_doc.get("app_metadata", {}),
+            "user_metadata": user_doc.get("user_metadata", {}),
+            "created_at": user_doc.get("created_at"), # Motor returns datetime; FastAPI handles serialization
+            "role": token_data.get("role", "user"), # Role comes from the token itself
+            "is_active": user_doc.get("is_active", True) # From user document
         }
+    except HTTPException: # Re-raise HTTPExceptions directly
+        raise
     except Exception as e:
+        # Log error e if a logger is available
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Could not validate credentials: {str(e)}",
-        ) 
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, # Or 401 if more appropriate
+            detail=f"Could not validate credentials or fetch user: {str(e)}",
+        )

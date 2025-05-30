@@ -113,5 +113,4 @@ class Project(ProjectBase):
     created_at: datetime
     updated_at: Optional[datetime] = None
 
-    class Config:
-        orm_mode = True 
+    model_config = {"from_attributes": True}

@@ -2,7 +2,9 @@ fastapi==0.104.1
 uvicorn==0.23.2
 python-dotenv==1.0.0
 pydantic==2.4.2
-supabase==1.0.3
+motor==3.3.2
+dnspython==2.4.2
+passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
 cloudinary==1.36.0
 httpx==0.25.0
@@ -12,6 +14,5 @@ numpy==1.26.0
 pandas==2.1.1
 reportlab==4.0.7
 pytest==7.4.3
-python-jose==3.3.0
+python-jose==3.3.0 # Ensure this includes [cryptography] or it's handled by the version
 tenacity==8.2.3
-supabase-pydantic==0.1.7 

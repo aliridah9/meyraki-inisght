@@ -5,6 +5,7 @@ import os
 
 from app.api.api import api_router
 from app.core.config import settings
+from app.db.mongodb import connect_to_mongo, close_mongo_connection # Added import
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -25,6 +26,15 @@ if settings.BACKEND_CORS_ORIGINS:
 
 # Include API routes
 app.include_router(api_router, prefix=settings.API_V1_STR)
+
+# Event handlers for MongoDB connection
+@app.on_event("startup")
+async def startup_db_client():
+    await connect_to_mongo()
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    await close_mongo_connection()
 
 # Root endpoint
 @app.get("/")
