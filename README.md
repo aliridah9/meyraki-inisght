@@ -15,7 +15,7 @@ Meyraki Insight is an AI-powered spatial intelligence platform for hospitality a
 
 ### Backend
 - **FastAPI** (Python): API framework
-- **Supabase** (PostgreSQL): Database and authentication
+- **MongoDB**: Database (using Motor for async access)
 - **Cloudinary**: File storage for floorplans, heatmaps, and reports
 - **OpenCV & scikit-learn**: Computer vision and machine learning
 
@@ -58,7 +58,7 @@ Meyraki Insight is an AI-powered spatial intelligence platform for hospitality a
 
 - Python 3.10+
 - Node.js 16+
-- Supabase account
+- MongoDB instance (local or Atlas)
 - Cloudinary account
 
 ### Backend Setup
@@ -83,10 +83,12 @@ Meyraki Insight is an AI-powered spatial intelligence platform for hospitality a
 
 4. Create a `.env` file in the backend directory (copy from env.template):
    ```
-   # Supabase Configuration
-   SUPABASE_URL=your_supabase_url
-   SUPABASE_KEY=your_supabase_key
-   SUPABASE_JWT_SECRET=your_supabase_jwt_secret
+   # MongoDB Configuration
+   MONGODB_CONNECTION_STRING=your_mongodb_connection_string (e.g., mongodb://localhost:27017 or Atlas URI)
+   MONGODB_DATABASE_NAME=your_database_name (e.g., meyraki_db)
+
+   # JWT Configuration
+   JWT_SECRET_KEY=your_new_strong_secret_key_for_jwt
 
    # Cloudinary Configuration
    CLOUDINARY_CLOUD_NAME=your_cloudinary_cloud_name
@@ -116,9 +118,8 @@ Meyraki Insight is an AI-powered spatial intelligence platform for hospitality a
 2. Create a `.env` file in the frontend directory:
    ```
    REACT_APP_API_URL=http://localhost:8000/api/v1
-   REACT_APP_SUPABASE_URL=your_supabase_url
-   REACT_APP_SUPABASE_ANON_KEY=your_supabase_anon_key
    ```
+   (Note: Frontend integration with the new backend authentication and data source will require separate updates to the frontend code.)
 
 3. Run the frontend:
    ```bash
@@ -128,77 +129,18 @@ Meyraki Insight is an AI-powered spatial intelligence platform for hospitality a
 
 ## Database Setup
 
-### Supabase Tables Structure
+### MongoDB Collections
 
-Create the following tables in your Supabase project:
+The application now uses MongoDB. The following collections are used:
 
-1. **projects**
-   ```sql
-   create table projects (
-     id uuid primary key,
-     user_id uuid not null,
-     name text not null,
-     description text,
-     space_type text not null,
-     objectives text[] not null,
-     custom_objectives text[],
-     additional_notes text,
-     status text not null,
-     created_at timestamptz not null,
-     updated_at timestamptz
-   );
-   ```
+*   **users**: Stores user information (authentication and user details).
+*   **projects**: Stores project details.
+*   **floorplans**: Stores metadata for uploaded floorplan files.
+*   **usage_data_files**: Stores metadata for uploaded usage data files.
+*   **insight_results**: Stores results of insight generation.
+*   **moodboard_results**: Stores generated moodboard details.
 
-2. **floorplans**
-   ```sql
-   create table floorplans (
-     project_id uuid primary key references projects(id) on delete cascade,
-     file_id text not null,
-     filename text not null,
-     url text not null,
-     file_type text not null,
-     created_at timestamptz not null,
-     size int not null,
-     width int,
-     height int
-   );
-   ```
-
-3. **usage_data**
-   ```sql
-   create table usage_data (
-     project_id uuid primary key references projects(id) on delete cascade,
-     file_id text not null,
-     filename text not null,
-     url text not null,
-     created_at timestamptz not null,
-     size int not null,
-     row_count int,
-     column_count int
-   );
-   ```
-
-4. **insight_results**
-   ```sql
-   create table insight_results (
-     project_id uuid primary key references projects(id) on delete cascade,
-     heatmap_url text,
-     recommendations jsonb not null,
-     report_url text,
-     created_at timestamptz not null,
-     updated_at timestamptz
-   );
-   ```
-
-5. **moodboard_results**
-   ```sql
-   create table moodboard_results (
-     project_id uuid primary key references projects(id) on delete cascade,
-     moodboard_url text not null,
-     style_description text not null,
-     created_at timestamptz not null
-   );
-   ```
+Data validation and schema enforcement are primarily handled by Pydantic models within the FastAPI application. Refer to files in `backend/app/models/` for schema details.
 
 ## API Documentation
 
