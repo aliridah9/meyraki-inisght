@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from typing import Dict, List, Any, Optional
 
 from app.services.analysis_service import analysis_service
@@ -10,6 +10,7 @@ router = APIRouter()
 @router.post("/{project_id}/generate", status_code=status.HTTP_202_ACCEPTED)
 async def generate_insights(
     project_id: str,
+    background_tasks: BackgroundTasks, # Add this
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
@@ -39,13 +40,12 @@ async def generate_insights(
                 detail="Project must have a floorplan uploaded"
             )
             
-        # Generate insights
-        result = await analysis_service.generate_insights(project_id)
+        # Add insight generation to background tasks
+        background_tasks.add_task(analysis_service.generate_insights, project_id)
         
         return {
-            "message": "Insights generated successfully",
-            "heatmap_url": result["heatmap_url"],
-            "report_url": result["report_url"]
+            "message": "Insight generation process started in the background. " +
+                       "Results will be available shortly. You can poll the GET /insights/{project_id} endpoint."
         }
     except HTTPException:
         raise

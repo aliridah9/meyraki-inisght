@@ -2,9 +2,11 @@ import io
 import numpy as np
 import pandas as pd
 import cv2
-from PIL import Image
+from PIL import Image, ImageDraw
 import urllib.request
 from typing import Dict, Any, List, Optional, Tuple
+import scipy.stats
+import matplotlib.cm
 import httpx
 import json
 import time
@@ -42,14 +44,34 @@ class AnalysisService:
             # Convert to OpenCV format
             nparr = np.frombuffer(image_data, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if img is None:
+                raise Exception("Failed to decode image. Ensure it's a valid image format.")
+
+            # Image Scaling
+            TARGET_WIDTH = 1024.0
+            original_height, original_width = img.shape[:2]
             
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            if original_width == 0:
+                raise Exception("Original image width is zero, cannot scale.")
+
+            ratio = TARGET_WIDTH / original_width
+            target_height = int(original_height * ratio)
             
-            # Apply thresholding
-            _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+            # Ensure target_height is positive
+            if target_height <= 0:
+                target_height = 1 # Set to a minimum positive value
+
+            img_scaled = cv2.resize(img, (int(TARGET_WIDTH), target_height), interpolation=cv2.INTER_AREA)
             
-            # Find contours
+            # Convert the scaled image to grayscale
+            gray = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2GRAY)
+
+            # Apply adaptive thresholding
+            thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv2.THRESH_BINARY_INV, 11, 2)
+
+            # Find contours using the new thresholded image
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             # Get major zones based on contours
@@ -67,8 +89,8 @@ class AnalysisService:
                         "area": int(cv2.contourArea(contour))
                     })
             
-            # Calculate total floor area
-            height, width = img.shape[:2]
+            # Calculate total floor area using scaled image dimensions
+            height, width = img_scaled.shape[:2]
             total_area = width * height
             
             # Calculate space efficiency
@@ -76,8 +98,8 @@ class AnalysisService:
             efficiency = occupied_area / total_area if total_area > 0 else 0
             
             return {
-                "width": width,
-                "height": height,
+                "width": width, # Return scaled width
+                "height": height, # Return scaled height
                 "zones": zones,
                 "total_area": total_area,
                 "occupied_area": occupied_area,
@@ -148,13 +170,18 @@ class AnalysisService:
                         "count": int(count)
                     })
             
-            return {
+            result_data = {
                 "row_count": row_count,
                 "column_count": column_count,
                 "has_coordinates": has_coordinates,
                 "hotspots": hotspots,
                 "columns": list(df.columns)
             }
+
+            if has_coordinates:
+                result_data["points"] = df[["x", "y"]].values.tolist()
+
+            return result_data
             
         except Exception as e:
             raise Exception(f"Failed to process usage data: {str(e)}")
@@ -179,47 +206,93 @@ class AnalysisService:
             image_data = response.read()
             
             # Convert to Image
-            img = Image.open(io.BytesIO(image_data))
-            width, height = img.size
-            
-            # Create a transparent overlay for the heatmap
-            heatmap = np.zeros((height, width, 4), dtype=np.uint8)
-            
-            # Draw hotspots on the heatmap
-            if usage_data.get("has_coordinates"):
-                for hotspot in usage_data.get("hotspots", []):
-                    # Get hotspot properties
-                    x, y = hotspot["x"], hotspot["y"]
-                    strength = hotspot["strength"]
+            base_floorplan_pil = Image.open(io.BytesIO(image_data))
+            width, height = base_floorplan_pil.size
+
+            final_composite_pil = base_floorplan_pil.convert('RGBA')
+
+            # KDE Layer
+            usage_points = usage_data.get("points")
+            if usage_points and len(usage_points) >= 3: # Need a few points for KDE
+                data = np.array(usage_points).T
+                try:
+                    # Check for issues that might cause KDE to fail
+                    if data.shape[0] < 2: # Need at least 2 dimensions
+                        raise ValueError("Data for KDE must have at least 2 dimensions.")
+                    if data.shape[1] < 2: # Need at least 2 points for meaningful KDE
+                         raise ValueError("Not enough data points for a meaningful KDE.")
                     
-                    # Ensure coordinates are within image bounds
-                    if 0 <= x < width and 0 <= y < height:
-                        # Draw a gradient circle for each hotspot
-                        # Stronger hotspots have larger radius
-                        radius = int(50 * strength) + 20
-                        
-                        # Red color with alpha based on strength
-                        color = (255, 0, 0, int(200 * strength))
-                        
-                        # Draw circle on the heatmap
-                        cv2.circle(heatmap, (x, y), radius, color, -1)
-            
-            # Add zones from floorplan analysis
+                    # Check for collinearity or too few points for reliable KDE
+                    # A simple check for condition number; might need more robust checks
+                    if np.linalg.cond(np.cov(data)) > 1e8 : # Condition number too high
+                         pass # Potentially skip KDE or log a warning, or use simpler heatmap
+
+                    kde = scipy.stats.gaussian_kde(data)
+
+                    # Create grid, ensuring division by non-zero
+                    grid_width_steps = int(width / (width/100.0)) if width > 0 else 100
+                    grid_height_steps = int(height / (height/100.0)) if height > 0 else 100
+
+                    # Ensure steps are not zero
+                    grid_width_steps = max(1, grid_width_steps)
+                    grid_height_steps = max(1, grid_height_steps)
+
+                    xx, yy = np.mgrid[0:width:complex(0, grid_width_steps), 0:height:complex(0, grid_height_steps)]
+
+                    density_map = kde(np.vstack([xx.ravel(), yy.ravel()]))
+                    density_map_reshaped = density_map.reshape(xx.shape).T # Transpose to match image coords
+
+                    # Normalize density_map_reshaped to 0-1
+                    min_density = np.min(density_map_reshaped)
+                    max_density = np.max(density_map_reshaped)
+                    if max_density == min_density:
+                        density_norm = np.zeros_like(density_map_reshaped)
+                    else:
+                        density_norm = (density_map_reshaped - min_density) / (max_density - min_density)
+
+                    # Create an empty RGBA overlay for KDE
+                    # Note: density_norm is (grid_height_steps, grid_width_steps)
+                    # We need to map this onto the full image size (height, width)
+                    # This means each cell in density_norm covers multiple pixels if grid_steps < image_dims
+                    # For simplicity here, we'll create a full size overlay and assign colors based on nearest grid point
+                    # A more accurate way would be to interpolate or resize density_norm to (height, width)
+
+                    # Resize density_norm to full image dimensions using PIL
+                    density_norm_pil = Image.fromarray((density_norm * 255).astype(np.uint8))
+                    density_norm_resized_pil = density_norm_pil.resize((width, height), Image.Resampling.LANCZOS)
+                    density_norm_resized = np.array(density_norm_resized_pil) / 255.0
+
+                    kde_overlay_rgba_np = np.zeros((height, width, 4), dtype=np.uint8)
+
+                    for r_idx in range(height):
+                        for c_idx in range(width):
+                            norm_val = density_norm_resized[r_idx, c_idx]
+                            rgba_color = matplotlib.cm.jet(norm_val) # Use jet colormap
+
+                            kde_overlay_rgba_np[r_idx, c_idx, 0] = int(rgba_color[0] * 255)  # R
+                            kde_overlay_rgba_np[r_idx, c_idx, 1] = int(rgba_color[1] * 255)  # G
+                            kde_overlay_rgba_np[r_idx, c_idx, 2] = int(rgba_color[2] * 255)  # B
+                            kde_overlay_rgba_np[r_idx, c_idx, 3] = int(norm_val * 200) # Alpha, max 200
+
+                    kde_pil = Image.fromarray(kde_overlay_rgba_np, 'RGBA')
+                    final_composite_pil = Image.alpha_composite(final_composite_pil, kde_pil)
+
+                except Exception as e_kde:
+                    print(f"KDE Heatmap generation failed: {e_kde}. Skipping KDE layer.") # Proper logging needed
+
+            # Zone Layer
+            zone_overlay_pil = Image.new('RGBA', final_composite_pil.size, (0,0,0,0))
+            draw_context = ImageDraw.Draw(zone_overlay_pil)
+
             for zone in floorplan_data.get("zones", []):
                 x, y, w, h = zone["x"], zone["y"], zone["width"], zone["height"]
-                
-                # Draw semi-transparent blue rectangle for each zone
-                cv2.rectangle(heatmap, (x, y), (x + w, y + h), (0, 0, 255, 60), 2)
+                draw_context.rectangle([(x,y), (x+w, y+h)], outline=(0, 0, 255, 180), width=3) # Blue, semi-transparent
             
-            # Convert NumPy array to PIL Image
-            heatmap_img = Image.fromarray(heatmap, 'RGBA')
-            
-            # Overlay heatmap on floorplan
-            result = Image.alpha_composite(img.convert('RGBA'), heatmap_img)
+            final_composite_pil = Image.alpha_composite(final_composite_pil, zone_overlay_pil)
             
             # Save to bytes
             img_byte_arr = io.BytesIO()
-            result.save(img_byte_arr, format='PNG')
+            final_composite_pil.save(img_byte_arr, format='PNG')
             img_byte_arr.seek(0)
             
             # Upload to Cloudinary
@@ -582,16 +655,48 @@ class AnalysisService:
                              space_type: SpaceType) -> List[str]:
         """Generate flow recommendations"""
         recommendations = []
+        zones = floorplan_data.get("zones", [])
         
         # Check hotspots for congestion
         if usage_data.get("has_coordinates") and usage_data.get("hotspots"):
-            # Find hotspots with high activity
             high_traffic_spots = [h for h in usage_data["hotspots"] if h["strength"] > 0.3]
             
             if high_traffic_spots:
-                recommendations.append(f"High traffic areas detected at several points. Consider widening pathways in these areas.")
-        
-        # Check for zone-specific recommendations
+                for hotspot in high_traffic_spots:
+                    hx, hy = hotspot["x"], hotspot["y"]
+                    found_in_zone = False
+                    for zone in zones:
+                        zx, zy, zw, zh = zone["x"], zone["y"], zone["width"], zone["height"]
+                        if zx < hx < zx + zw and zy < hy < zy + zh:
+                            recommendations.append(
+                                f"High traffic area detected near Zone {zone['id']} (approx. center x={hx}, y={hy}). "
+                                f"Consider widening pathways in or leading to this zone."
+                            )
+                            found_in_zone = True
+                            break
+                    if not found_in_zone:
+                        recommendations.append(
+                            f"High traffic area detected at coordinates (x={hx}, y={hy}). "
+                            f"Consider widening pathways in this general area."
+                        )
+            elif not zones: # No high traffic but also no zones to reference
+                 recommendations.append("Consider defining zones in your floorplan to better analyze foot traffic and flow.")
+
+        elif zones: # No usage data, but zones exist
+            zone_ids = [zone['id'] for zone in zones[:3]] # Example: Zone A, Zone B, Zone C
+            if len(zone_ids) > 1 :
+                 recommendations.append(
+                    f"Ensure clear and wide enough pathways connect all identified major zones "
+                    f"(e.g., {', '.join(zone_ids)})."
+                )
+            elif len(zone_ids) == 1:
+                 recommendations.append(
+                    f"Ensure clear and wide pathways within and leading to Zone {zone_ids[0]}."
+                 )
+        else: # No usage data and no zones
+            recommendations.append("Upload usage data or define floorplan zones for more specific flow recommendations.")
+
+        # Original space-type specific recommendations (can be kept or refined)
         if space_type == SpaceType.HOTEL:
             recommendations.extend([
                 "Create a clear path from entrance to reception",
@@ -620,15 +725,30 @@ class AnalysisService:
         return recommendations
     
     @staticmethod
-    def _get_ambiance_recommendations(space_type: SpaceType) -> List[str]:
+    def _get_ambiance_recommendations(floorplan_data: Dict[str, Any], space_type: SpaceType) -> List[str]:
         """Generate ambiance recommendations"""
         recommendations = []
+        zones = floorplan_data.get("zones", [])
         
         # Generic ambiance recommendations
-        recommendations.append("Layer lighting with ambient, task, and accent fixtures")
-        recommendations.append("Use materials and textures that align with your brand identity")
+        recommendations.append("Layer lighting with ambient, task, and accent fixtures throughout the space.")
+        recommendations.append("Use materials, colors, and textures that align with your brand identity and desired atmosphere for a {space_type.value}.")
         
-        # Space-specific recommendations
+        if zones:
+            largest_zone = max(zones, key=lambda z: z['area'], default=None)
+            if largest_zone:
+                recommendations.append(
+                    f"Pay particular attention to ambiance in key zones such as {largest_zone['id']} (largest identified zone). "
+                    f"Also, consider high-traffic zones if identified in usage patterns."
+                )
+            else:
+                recommendations.append(
+                    "Apply these ambiance considerations systematically across all identified zones."
+                )
+        else:
+            recommendations.append("Defining zones in your floorplan can help tailor ambiance strategies to specific areas.")
+
+        # Original space-specific recommendations
         if space_type == SpaceType.HOTEL:
             recommendations.extend([
                 "Create a memorable arrival experience with statement lighting and art",
@@ -658,18 +778,51 @@ class AnalysisService:
     
     @staticmethod
     def _get_zoning_recommendations(floorplan_data: Dict[str, Any], usage_data: Dict[str, Any], 
-                               space_type: SpaceType) -> List[str]:
+                               space_type: SpaceType) -> List[str]: # project: Project could be added if objectives are needed
         """Generate zoning recommendations"""
         recommendations = []
-        
-        zones_count = len(floorplan_data.get("zones", []))
-        
-        if zones_count < 3:
-            recommendations.append("Consider creating more distinct zones to better organize the space")
-        elif zones_count > 8:
-            recommendations.append("The space may have too many separate zones. Consider simplifying to improve clarity")
-        
-        # Space-specific zoning recommendations
+        zones = floorplan_data.get("zones", [])
+        total_occupied_area = floorplan_data.get("occupied_area", 1) # Avoid division by zero if no zones
+        total_area = floorplan_data.get("total_area", 1)
+
+        if not zones:
+            recommendations.append("No zones identified. Define zones in your floorplan to get specific zoning advice.")
+        else:
+            zones_count = len(zones)
+            if zones_count < 3:
+                recommendations.append("Consider creating more distinct zones (at least 3) to better organize the space according to its functions.")
+            elif zones_count > 8:
+                recommendations.append(f"The space is divided into {zones_count} zones. If this feels too fragmented, consider simplifying or merging some to improve clarity and flow, depending on your operational needs for a {space_type.value} environment.")
+
+            avg_zone_area = total_occupied_area / zones_count if zones_count > 0 else 0
+
+            for zone in zones:
+                zone_id = zone["id"]
+                zone_area = zone["area"]
+                # Check for very large zones
+                if total_occupied_area > 0 and zone_area / total_occupied_area > 0.5: # Zone takes >50% of occupied area
+                    recommendations.append(
+                        f"Zone {zone_id} is very large, covering over 50% of the identified occupied space. "
+                        f"Review if its current use effectively utilizes this entire area for a {space_type.value}, "
+                        f"or if it could be subdivided to serve multiple functions or objectives."
+                    )
+                elif zones_count > 1 and avg_zone_area > 0 and zone_area > 3 * avg_zone_area: # Significantly larger than average
+                     recommendations.append(
+                        f"Zone {zone_id} is substantially larger (more than 3x the average zone size). "
+                        f"Ensure its size is justified by its function within a {space_type.value} space, "
+                        f"or consider if it can be optimized or partially allocated to other needs."
+                    )
+
+            # Check for many small zones (avg area < 5% of total floorplan area)
+            if zones_count > 3 and avg_zone_area / total_area < 0.05 : # average zone area is < 5% of total floorplan area
+                 recommendations.append(
+                    f"There are {zones_count} zones identified, and the average zone size is relatively small "
+                    f"(less than 5% of the total floorplan area). Ensure this level of division is necessary "
+                    f"and effectively serves your objectives for a {space_type.value}. "
+                    f"If not, consider combining some smaller zones for better flow or utility."
+                )
+
+        # Original space-specific zoning recommendations (can be kept or refined)
         if space_type == SpaceType.HOTEL:
             recommendations.extend([
                 "Clearly separate public, semi-private, and private zones",
@@ -692,14 +845,34 @@ class AnalysisService:
         return recommendations
     
     @staticmethod
-    def _get_revenue_recommendations(usage_data: Dict[str, Any], space_type: SpaceType) -> List[str]:
+    def _get_revenue_recommendations(floorplan_data: Dict[str, Any], usage_data: Dict[str, Any], space_type: SpaceType) -> List[str]:
         """Generate revenue-focused recommendations"""
         recommendations = []
+        zones = floorplan_data.get("zones", [])
         
         # Generic revenue recommendations
-        recommendations.append("Position high-margin items/services in high-visibility locations")
-        
-        # Space-specific revenue recommendations
+        recommendations.append("Position high-margin items/services in high-visibility locations. Analyze customer paths if usage data is available.")
+
+        if zones:
+            largest_zone = max(zones, key=lambda z: z['area'], default=None)
+            # Attempt to find entrance zone if names are standardized, otherwise use largest or high traffic
+            # This is a placeholder for more advanced zone semantic understanding
+            entrance_zone_candidates = [z for z in zones if "entrance" in z.get("name", "").lower() or "lobby" in z.get("name", "").lower()]
+            key_operational_zone = None
+            if entrance_zone_candidates:
+                key_operational_zone = entrance_zone_candidates[0]
+            elif largest_zone:
+                key_operational_zone = largest_zone
+
+            if key_operational_zone:
+                 recommendations.append(
+                    f"Consider the strategic placement of revenue-generating elements relative to key areas like Zone {key_operational_zone['id']}. "
+                    f"If usage data shows specific high-traffic zones, prioritize those."
+                )
+        else:
+            recommendations.append("Defining functional zones (e.g., entrance, retail area, service points) can help optimize placement for revenue generation.")
+
+        # Original space-specific revenue recommendations
         if space_type == SpaceType.HOTEL:
             recommendations.extend([
                 "Create compelling upgrade paths through room design hierarchy",
@@ -727,13 +900,31 @@ class AnalysisService:
         recommendations = []
         
         efficiency = floorplan_data.get("efficiency", 0)
+        zones = floorplan_data.get("zones", [])
         
         if efficiency < 0.5:
-            recommendations.append("The space utilization is low. Consider consolidating zones to reduce wasted space")
-        elif efficiency > 0.8:
-            recommendations.append("The space is very densely used. Consider creating more breathing room in key areas")
+            base_message = "The overall space utilization (efficiency) is low ({:.1f}%). ".format(efficiency * 100)
+            if zones:
+                example_zone_ids = [z["id"] for z in zones[:2]] # Get up to 2 example zone IDs
+                if example_zone_ids:
+                    base_message += (f"Review the floor plan for large, undefined or underutilized areas. "
+                                     f"These could potentially be assigned new functions, expanded from existing zones like {', '.join(example_zone_ids)}, "
+                                     f"or developed into new zones to better serve your {space_type.value} objectives.")
+                else: # Should not happen if zones exist, but as a fallback
+                    base_message += ("Consider if all areas of the floorplan have a defined purpose. "
+                                     "Assigning functions to unused spaces can improve overall efficiency.")
+            else:
+                base_message += ("Consider defining functional zones in your floorplan. This can help identify "
+                                 "underutilized spaces and improve overall efficiency for your {space_type.value}.")
+            recommendations.append(base_message)
+        elif efficiency > 0.85: # Changed from 0.8 to 0.85 for very dense
+            recommendations.append(
+                "The space is very densely used ({:.1f}% efficiency). While high utilization can be good, ".format(efficiency * 100) +
+                f"ensure this doesn't compromise comfort, flow, or safety, especially in a {space_type.value} setting. "
+                "Verify if key areas or pathways need more breathing room."
+            )
         
-        # Space-specific efficiency recommendations
+        # Original space-specific efficiency recommendations (can be kept or refined)
         if space_type == SpaceType.OFFICE:
             recommendations.extend([
                 "Evaluate workstation-to-employee ratio based on daily occupancy patterns",
