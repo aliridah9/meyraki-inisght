@@ -12,6 +12,7 @@ from app.models.project import (
 from app.services.project_service import project_service
 from app.services.cloudinary_service import cloudinary_service
 from app.services.auth_service import get_current_user
+from app.utils.file_utils import convert_pdf_to_image
 
 router = APIRouter()
 
@@ -174,24 +175,62 @@ async def upload_floorplan(
                 detail="You don't have permission to update this project"
             )
             
-        # Check file extension
-        file_ext = file.filename.split(".")[-1].lower()
-        if file_ext not in ["jpg", "jpeg", "png", "pdf", "dwg"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File must be an image (JPG, PNG) or a document (PDF, DWG)"
-            )
+        # Default values
+        file_content_for_upload = None
+        file_name_for_upload = file.filename.replace(" ", "_")
+        resource_type_for_upload = "image" # Default for images, or after PDF conversion
+
+        if file.filename.lower().endswith('.pdf'):
+            pdf_content = await file.read()
+            image_bytes = await convert_pdf_to_image(pdf_content)
+            if image_bytes:
+                file_content_for_upload = image_bytes
+                file_name_for_upload = file.filename.rsplit('.', 1)[0].replace(" ", "_") + ".png"
+                # resource_type_for_upload is already "image"
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Failed to convert PDF to image."
+                )
+        else:
+            # Check file extension for non-PDFs
+            file_ext = file.filename.split(".")[-1].lower()
+            if file_ext not in ["jpg", "jpeg", "png", "dwg"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="File must be an image (JPG, PNG), PDF, or DWG"
+                )
             
-        # Read file content
-        file_content = await file.read()
-        
+            file_content_for_upload = await file.read()
+            # For DWG, resource_type might be 'raw' or 'auto' depending on Cloudinary settings
+            if file_ext == "dwg":
+                resource_type_for_upload = "raw"
+
+
+        if not file_content_for_upload:
+             # This case should ideally not be reached if logic is correct,
+             # but as a safeguard / if file.read() was empty for some reason.
+            await file.seek(0) # Reset pointer just in case it was read partially
+            file_content_for_upload = await file.read()
+            if not file_content_for_upload:
+                 raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="File content is empty or could not be read."
+                )
+
         # Upload to Cloudinary
         folder = f"meyraki/floorplans/{project_id}"
-        file_name = file.filename.replace(" ", "_")
         
-        cloud_response = await cloudinary_service.upload_file(file_content, folder, file_name)
+        cloud_response = await cloudinary_service.upload_file(
+            file_content_for_upload,
+            folder,
+            file_name_for_upload,
+            resource_type=resource_type_for_upload
+        )
         
         # Update project with floorplan
+        # Ensure add_floorplan can handle the correct filename and type (e.g. if PDF became PNG)
+        # The cloud_response should contain the necessary details like the new URL and format.
         floorplan = await project_service.add_floorplan(project_id, cloud_response)
         
         # Return the response

@@ -90,4 +90,31 @@ def generate_unique_filename(filename: str, prefix: str = "") -> str:
     else:
         unique_filename = f"{base_name}_{timestamp}_{unique_id}.{extension}"
         
-    return unique_filename 
+    return unique_filename
+
+import io
+import asyncio
+from typing import Optional
+from pdf2image import convert_from_bytes
+from PIL import Image
+
+async def convert_pdf_to_image(pdf_bytes: bytes) -> Optional[bytes]:
+    """
+    Converts the first page of a PDF byte stream to a PNG image byte stream.
+    Uses a thread pool executor for the blocking pdf2image call.
+    """
+    try:
+        # convert_from_bytes is a blocking I/O-bound operation
+        # Run it in a separate thread to avoid blocking the asyncio event loop
+        pil_images = await asyncio.to_thread(convert_from_bytes, pdf_bytes, first_page=1, last_page=1)
+
+        if pil_images:
+            img_byte_arr = io.BytesIO()
+            pil_images[0].save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+            return img_byte_arr.getvalue()
+        return None
+    except Exception as e:
+        # In a real app, you'd log this error
+        print(f"Error converting PDF to image: {e}") # Replace with proper logging
+        return None
